@@ -15,50 +15,34 @@ import pandas as pd
 from sklearn import preprocessing
 import  utils
 import warnings
+
 warnings.filterwarnings('ignore')
-spark = SparkSession.builder.appName("DataFrame").getOrCreate()
-def merge_csv():
 
-    device = spark.read.options(header='True', inferSchema='True', delimiter=',').csv("r4.2/device.csv")
-    device = device.drop('id','pc')
-    device = device.withColumn('activity', F.when(device.activity == 'Connect', '1').otherwise(device.activity))
-    device = device.withColumn('activity', F.when(device.activity == 'Disconnect', '2').otherwise(device.activity))
+conf = SparkConf()
+
+conf.set("spark.driver.memory", "5g")  # 这里是增加jvm的内存
 
 
-    email = spark.read.options(header='True', inferSchema='True', delimiter=',').csv("r4.2/email.csv")
-    email = email.drop('id', 'pc','to','from','cc','bcc','from','size','attachments','content')
-    email = email.withColumn("activity",F.lit('3'))
+spark = SparkSession.builder.appName("DataFrame").config(conf=conf).getOrCreate()
 
-    file = spark.read.options(header='True', inferSchema='True', delimiter=',').csv("r4.2/file.csv")
-    file = file.drop('id', 'pc', 'content' , 'filename')
-    file = file.withColumn("activity",F.lit('4'))
 
-    http = spark.read.options(header='True', inferSchema='True', delimiter=',').csv("r4.2/http.csv")
-    http = http.drop('id', 'pc', 'content', 'url')
-    http = http.withColumn("activity",F.lit('5'))
-
-    logon = spark.read.options(header='True', inferSchema='True', delimiter=',').csv("r4.2/logon.csv")
-    logon = logon.drop('id', 'pc')
-    logon = logon.withColumn('activity', F.when(logon.activity == 'Logon', '6').otherwise(logon.activity))
-    logon = logon.withColumn('activity', F.when(logon.activity == 'Logoff', '7').otherwise(logon.activity))
-
-    df = spark.createDataFrame(spark.sparkContext.emptyRDD(),device.schema)
-    df = df.union(device)
-    df = df.union(email)
-    df = df.union(file)
-    df = df.union(http)
-    df = df.union(logon)
-    df.printSchema()
-
-    df = df.withColumn("day", F.substring(df.date, 1, 10))
-
-    df.coalesce(1)  \
-    .write.mode("overwrite")  \
-    .option("mapreduce.fileoutputcommitter.marksuccessfuljobs","false") \
-    .option("header","true") \
-    .csv("E:\SDP\PolicyEngine\data\merge_data")
-
-def group_data():
+schema = StructType([
+    StructField("user", StringType(), True), \
+    StructField("day", StringType(), True), \
+    StructField("time_seq",ArrayType(
+        StructType([
+            StructField("feature",IntegerType(),True),
+            StructField("label",IntegerType(),True)
+        ])
+    ),True)
+])
+def wirte_csv(df,path):
+    df.coalesce(1) \
+        .write.mode("overwrite") \
+        .option("mapreduce.fileoutputcommitter.marksuccessfuljobs", "false") \
+        .option("header", "true") \
+        .csv(path)
+def group_data_action():
     df = spark.read.options(header='True', inferSchema='True', delimiter=',').csv(
         "data/merge_data/part-00000-921ca085-0f2a-4b32-a2a6-782e829ab0f4-c000.csv")
 
@@ -74,13 +58,86 @@ def group_data():
     grouped_df = grouped_df.withColumn("actions",
                                        F.concat_ws(",", F.col("actions")))
 
-    grouped_df.coalesce(1) \
-        .write.mode("overwrite") \
-        .option("mapreduce.fileoutputcommitter.marksuccessfuljobs", "false") \
-        .option("header", "true") \
-        .csv("E:\SDP\PolicyEngine\data\group_data")
+    wirte_csv(grouped_df,'data\group_data')
+
+def group_data_feature():
+
+    df = spark.read.options(header='True', inferSchema='True', delimiter=',').csv(
+        "data/merge_data/part-00000-7c491a38-d108-437d-8d76-5464d80b1754-c000.csv")
+
+    #01/02/2010 07:21:06
+
+    user_group = Window.partitionBy("user","day").orderBy("date")
+
+    grouped_df = df.withColumn("time_seq", F.collect_list(F.struct("feature","label")).over(user_group)
+                               ).groupby("user","day").agg(F.max("time_seq").alias("time_seq"),
+                                                            )
+    '''
+
+    grouped_df = grouped_df.withColumn("time_seq",
+                                       F.col("time_seq").cast('string'))\
+        .orderBy("user")
+
+   # wirte_csv(grouped_df,'data\group_data_today')
+    
+    '''
+    return grouped_df
+def seq_data_feature(df):
+    '''
+
+    :param df:
+    :return:
+    '''
+    '''
+    df = spark.read.options(header='True', inferSchema='True', delimiter=',').csv(
+        "data/group_data_today/part-00000-3bbd0d31-9766-4ec1-860f-6c3d273686d9-c000.csv")
+    '''
+
+    df = df.withColumnRenamed("time_seq","features")
+
+    df.printSchema()
+
+  #  df = df.withColumn("size",F.size(df.features))
+
+  #  df.select(F.mean(df.size)).show()
+
+    schema = StructType([ \
+        StructField("user", StringType(), True),
+        StructField("features", ArrayType(StringType(), containsNull=True), True),
+        StructField("danger", IntegerType(), True),
+        ])
+
+    n = 32
+
+    seq_df = df.withColumn("features", F.expr(f"""
+               filter(
+         transform(features,(x,i)-> if (i%{n}==0 ,slice(features,i+1,{n})
+         , null)),x->
+               x is not null)                               
+    """))
 
 
+    seq_df = seq_df.select("user", "day", F.explode(seq_df.features).alias("features")).distinct()
+
+    print(seq_df.count())
+    seq_df = seq_df.withColumn("label_sum", F.explode(seq_df.features))
+
+    seq_df = seq_df.withColumn("l",seq_df.label_sum.getField("label"))
+
+    seq_df = seq_df.groupby("user","day","features").agg(F.sum("l").alias('danger'))
+
+    seq_df = seq_df.withColumn("features",
+                                F.col("features").cast('string'))
+
+    seq_df = seq_df.drop("user","day")
+
+
+    seq_df.show()
+    wirte_csv(seq_df, "data\seq_data_today")
+
+
+
+seq_data_feature(group_data_feature())
 def seq_data():
     df = spark.read.options(header='True', inferSchema='True', delimiter=',').csv(
         "data/group_data/part-00000-80d03d14-87b7-4abf-b4e5-ab534fb43fbf-c000.csv")
@@ -129,13 +186,11 @@ def seq_data():
     seq_df = seq_df.select("user","day",F.explode(seq_df.actions).alias("actions")).distinct()
     seq_df = seq_df.withColumn("actions",
                                        F.concat_ws(",", F.col("actions")))
-    seq_df.coalesce(1) \
-        .write.mode("overwrite") \
-        .option("mapreduce.fileoutputcommitter.marksuccessfuljobs", "false") \
-        .option("header", "true") \
-        .csv("E:\SDP\PolicyEngine\data\seq_data")
 
-seq_data()
+    wirte_csv(seq_df,"data\seq_data")
+
+
+
 # 生成训练数据x并做标准化后，构造成dataframe格式，再转换为tensor格式
 #df = pd.DataFrame(data=preprocessing.StandardScaler().fit_transform(np.random.randint(0, 10, size=(200, 5))))
 #y = pd.Series(np.random.randint(0, 2, 200))

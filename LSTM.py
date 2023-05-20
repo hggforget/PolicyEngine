@@ -19,7 +19,7 @@ def get_train_data():
 
 
 class LSTM(nn.Module):
-    def __init__(self, input_size=5, hidden_layer_size=100, output_size=1):
+    def __init__(self, input_size=32, hidden_layer_size=100, output_size=1):
         """
         LSTM二分类任务
         :param input_size: 输入数据的维度
